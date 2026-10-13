@@ -28,6 +28,7 @@ Global flags must come before `analyze`. See the [CLI overview](/fundamentals/co
 | `--no-stubs` | Skip the built-in PHP standard-library stubs. Use only when you have a reason. |
 | `--skip-ignores` | Ignore the `ignore` list from `mago.toml` and report every issue found. Inline suppressions still apply. |
 | `--slow-file-warning-threshold-ms <MILLISECONDS>` | Override the per-file slow analysis warning threshold from `mago.toml`. |
+| `--cache <FILE_OR_DIR>` | Persist raw analysis results and reuse them when all inputs are unchanged. See [Persistent cache](#persistent-cache). |
 | `--staged` | Analyze only files staged in git. Fails outside a git repository. |
 | `--stdin-input` | Read file content from stdin and use the single path argument for baseline lookup and reporting. Intended for editor integrations. |
 | `--substitute <ORIG=TEMP>` | Replace one host file with another for this invocation. Intended for mutation testing. Repeatable. |
@@ -36,6 +37,18 @@ Global flags must come before `analyze`. See the [CLI overview](/fundamentals/co
 | `-h`, `--help` | Print help and exit. |
 
 The shared flags for reporting, fixing, and baselines are documented on the [reporting and fixing options](/fundamentals/shared-reporting-options/) page.
+
+## Persistent cache
+
+Use `--cache` to avoid repeating type analysis when the effective configuration and every loaded source, dependency, stub, patch, and extension-provided file are unchanged:
+
+```sh
+mago analyze --cache .mago-cache
+```
+
+If the path is an existing directory, or a non-existing path without an extension, Mago stores the cache in `<path>/analyze.bin`. Otherwise the path is used as the exact cache filename. Parent directories are created automatically.
+
+The cache stores analyzer issues before ignore, baseline, and reporting filters are applied, so the same entry can be used with different reporting options. Cache corruption and I/O errors never prevent analysis: Mago warns, performs a full analysis, and attempts to replace the cache. The option conflicts with `--watch`, which already keeps incremental analysis state in memory.
 
 ## Reading from stdin
 

@@ -33,12 +33,14 @@
 //! checking even for external symbols. Stubs can be disabled with `--no-stubs`
 //! for debugging or testing purposes.
 
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Duration;
 use std::time::Instant;
+use std::{fs, io};
 
 use clap::ColorChoice;
 use clap::Parser;
@@ -59,6 +61,9 @@ use mago_database::watcher::WatchOptions;
 use mago_orchestrator::Orchestrator;
 use mago_prelude::Prelude;
 use mago_reporting::CompiledIgnoreSet;
+use mago_reporting::IssueCollection;
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::commands::args::baseline_reporting::BaselineReportingArgs;
 use crate::commands::args::substitution::SubstitutionArgs;
@@ -139,6 +144,14 @@ pub struct AnalyzeCommand {
     #[arg(long, value_name = "MILLISECONDS")]
     pub slow_file_warning_threshold_ms: Option<u16>,
 
+    /// Reuse analysis results when all analyzer inputs are unchanged.
+    ///
+    /// An existing directory stores the cache as `analyze.bin`. A non-existing
+    /// extensionless path is created as a directory; other paths are cache files.
+    /// Invalid, stale, or unreadable caches are ignored and replaced.
+    #[arg(long, value_name = "FILE_OR_DIR", conflicts_with = "watch")]
+    pub cache: Option<PathBuf>,
+
     /// Enable watch mode for continuous analysis (experimental).
     ///
     /// When enabled, the analyzer watches the workspace for file changes and
@@ -158,7 +171,7 @@ pub struct AnalyzeCommand {
     ///
     /// Outputs a JSON array of all issue code strings that the analyzer
     /// can report. Useful for tooling integration and documentation.
-    #[arg(long, conflicts_with_all = ["path", "no_stubs", "skip_ignores", "slow_file_warning_threshold_ms", "watch", "reporting_target", "reporting_format"])]
+    #[arg(long, conflicts_with_all = ["path", "no_stubs", "skip_ignores", "slow_file_warning_threshold_ms", "cache", "watch", "reporting_target", "reporting_format"])]
     pub list_codes: bool,
 
     /// Only analyze files that are staged in git.
@@ -341,8 +354,46 @@ impl AnalyzeCommand {
         }
 
         let service_run_start = trace_enabled.then(Instant::now);
-        let service = orchestrator.get_analysis_service(database.read_only(), metadata, symbol_references);
-        let mut issues = service.run_issues()?;
+        let cache = self.cache.as_deref().map(resolve_cache_file);
+        let cache_fingerprint =
+            cache.as_ref().and_then(|_| match analysis_cache_fingerprint(&database, &configuration) {
+                Ok(fingerprint) => Some(fingerprint),
+                Err(error) => {
+                    tracing::warn!("Unable to fingerprint analysis inputs for caching: {error}");
+                    None
+                }
+            });
+        let cached_issues = cache.as_ref().zip(cache_fingerprint).and_then(|(path, fingerprint)| {
+            match load_analysis_cache(path, fingerprint) {
+                Ok(Some(issues)) => {
+                    tracing::info!("Analysis cache hit: {}", path.display());
+                    Some(issues)
+                }
+                Ok(None) => {
+                    tracing::info!("Analysis cache miss: {}", path.display());
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!("Unable to read analysis cache {}: {error}", path.display());
+                    None
+                }
+            }
+        });
+
+        let mut issues = if let Some(issues) = cached_issues {
+            issues
+        } else {
+            let service = orchestrator.get_analysis_service(database.read_only(), metadata, symbol_references);
+            let issues = service.run_issues()?;
+
+            if let Some((path, fingerprint)) = cache.as_ref().zip(cache_fingerprint)
+                && let Err(error) = save_analysis_cache(path, fingerprint, &issues)
+            {
+                tracing::warn!("Unable to write analysis cache {}: {error}", path.display());
+            }
+
+            issues
+        };
         let service_run_duration = service_run_start.map(|s| s.elapsed());
         let report_start = trace_enabled.then(Instant::now);
         let ignore_set = self.compile_ignore_set(&configuration);
@@ -564,6 +615,108 @@ impl AnalyzeCommand {
     }
 }
 
+const ANALYSIS_CACHE_SCHEMA: u32 = 1;
+const ANALYSIS_CACHE_FILENAME: &str = "analyze.bin";
+const MAXIMUM_ANALYSIS_CACHE_SIZE: u64 = 512 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct AnalysisCache {
+    schema: u32,
+    mago_version: String,
+    fingerprint: [u8; 32],
+    issues: IssueCollection,
+}
+
+/// Resolves a user-supplied cache location to a cache file.
+///
+/// Existing directories and non-existing extensionless paths are treated as
+/// directories. Everything else is treated as the exact cache filename.
+fn resolve_cache_file(path: &Path) -> PathBuf {
+    if path.is_dir() || (!path.exists() && path.extension().is_none()) {
+        path.join(ANALYSIS_CACHE_FILENAME)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Produces a deterministic digest of every input that can affect analysis.
+fn analysis_cache_fingerprint(
+    database: &Database<'_>,
+    configuration: &Configuration,
+) -> Result<[u8; 32], serde_json::Error> {
+    let mut hasher = blake3::Hasher::new();
+    hash_cache_input(&mut hasher, env!("CARGO_PKG_VERSION").as_bytes());
+    hash_cache_input(&mut hasher, &serde_json::to_vec(configuration)?);
+
+    // Database iteration order is unspecified, so sort by stable logical name.
+    let mut files: Vec<_> = database.files().collect();
+    files.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    for file in files {
+        hash_cache_input(&mut hasher, &file.name);
+        hasher.update(&[file.file_type as u8]);
+        hash_cache_input(&mut hasher, &file.contents);
+    }
+
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn hash_cache_input(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn load_analysis_cache(path: &Path, fingerprint: [u8; 32]) -> Result<Option<IssueCollection>, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+
+    if metadata.len() > MAXIMUM_ANALYSIS_CACHE_SIZE {
+        return Err(format!(
+            "cache is {} bytes, exceeding the {} byte safety limit",
+            metadata.len(),
+            MAXIMUM_ANALYSIS_CACHE_SIZE
+        ));
+    }
+
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let (cache, _): (AnalysisCache, usize) = bincode::serde::decode_from_slice(
+        &bytes,
+        bincode::config::standard().with_limit::<{ MAXIMUM_ANALYSIS_CACHE_SIZE as usize }>(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    if cache.schema != ANALYSIS_CACHE_SCHEMA
+        || cache.mago_version != env!("CARGO_PKG_VERSION")
+        || cache.fingerprint != fingerprint
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(cache.issues))
+}
+
+fn save_analysis_cache(path: &Path, fingerprint: [u8; 32], issues: &IssueCollection) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+
+    let cache = AnalysisCache {
+        schema: ANALYSIS_CACHE_SCHEMA,
+        mago_version: env!("CARGO_PKG_VERSION").to_owned(),
+        fingerprint,
+        issues: issues.clone(),
+    };
+    let bytes =
+        bincode::serde::encode_to_vec(&cache, bincode::config::standard()).map_err(|error| error.to_string())?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    temporary.write_all(&bytes).map_err(|error| error.to_string())?;
+    temporary.flush().map_err(|error| error.to_string())?;
+    temporary.persist(path).map_err(|error| error.error.to_string())?;
+
+    Ok(())
+}
+
 /// Sets up a file system watcher for non-PHP files that should trigger a full restart.
 ///
 /// Watches:
@@ -651,4 +804,37 @@ fn setup_restart_watcher(workspace: &Path, configuration: &Configuration) -> Res
     std::mem::forget(watcher);
 
     Ok(rx)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_existing_and_implicit_directories() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_cache_file(temporary.path()), temporary.path().join(ANALYSIS_CACHE_FILENAME));
+
+        let implicit = temporary.path().join("cache");
+        assert_eq!(resolve_cache_file(&implicit), implicit.join(ANALYSIS_CACHE_FILENAME));
+    }
+
+    #[test]
+    fn resolves_explicit_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("analysis.cache");
+        assert_eq!(resolve_cache_file(&file), file);
+    }
+
+    #[test]
+    fn cache_round_trip_and_fingerprint_miss() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("analysis.bin");
+        let fingerprint = [1; 32];
+        let issues = IssueCollection::new();
+
+        save_analysis_cache(&path, fingerprint, &issues).unwrap();
+        assert_eq!(load_analysis_cache(&path, fingerprint).unwrap(), Some(issues));
+        assert_eq!(load_analysis_cache(&path, [2; 32]).unwrap(), None);
+    }
 }

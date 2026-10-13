@@ -258,7 +258,7 @@ mago-word = { workspace = true }
 mago-bytes = { workspace = true }
 mago-syntax = { workspace = true, features = ["serde"] }
 mago-syntax-core = { workspace = true }
-mago-reporting = { workspace = true }
+mago-reporting = { workspace = true, features = ["serde"] }
 mago-database = { workspace = true }
 mago-linter = { workspace = true, features = ["serde"] }
 mago-names = { workspace = true }
@@ -300,6 +300,8 @@ unicode-width = { workspace = true }
 notify = { workspace = true }
 dhat = { workspace = true, optional = true }
 schemars = { workspace = true }
+blake3 = { workspace = true }
+bincode = { workspace = true }
 
 [[test]]
 name = "suite"
